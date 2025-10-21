@@ -18,6 +18,9 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+// Include GDA extensions
+#include "fi_ext_efa_gda.h"
+
 static void die(int rc, const char* where) {
     fprintf(stderr, "ERROR(%d) at %s\n", rc, where);
     std::exit(rc ? rc : 1);
@@ -103,11 +106,12 @@ int main() {
 
     if (sq_attr.doorbell) {
         void* db_dev = nullptr;
-        ce = cudaHostRegister(sq_attr.doorbell, sizeof(uint32_t), cudaHostRegisterPortable);
+        void* db_host = const_cast<void*>(static_cast<const volatile void*>(sq_attr.doorbell));
+        ce = cudaHostRegister(db_host, sizeof(uint32_t), cudaHostRegisterPortable);
         if (ce != cudaSuccess && ce != cudaErrorHostMemoryAlreadyRegistered) {
             fprintf(stderr, "cudaHostRegister(DB) failed: %s\n", cudaGetErrorString(ce));
         }
-        ce = cudaHostGetDevicePointer(&db_dev, sq_attr.doorbell, 0);
+        ce = cudaHostGetDevicePointer(&db_dev, db_host, 0);
         if (ce == cudaSuccess) {
             fprintf(stdout, "DB device pointer: %p\n", db_dev);
         } else {
