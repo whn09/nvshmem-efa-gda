@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
+// Device-side implementation for NVSHMEM + EFA GPUDirect Async
+// Based on official libfabric fabtests implementation:
+// https://github.com/ofiwg/libfabric/blob/main/fabtests/prov/efa/src/efagda/cuda_kernel.cu
+
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 #include "../include/transport_nvshmem_efa_gda.h"
 
 // Device symbols (storage)
@@ -9,70 +14,90 @@ __device__ uint32_t* __nvshmem_efa_sq_db    = nullptr;
 __device__ uint32_t  __nvshmem_efa_sq_stride = 0;
 __device__ uint32_t  __nvshmem_efa_sq_size   = 0;
 __device__ uint32_t  __nvshmem_efa_sq_tail   = 0;
+__device__ uint32_t  __nvshmem_efa_sq_phase  = 1;  // Initial phase is 1
+__device__ uint32_t  __nvshmem_efa_sq_mask   = 0;
 
-// Helpers for pointer arithmetic
-static __device__ __forceinline__ uint8_t* sq_slot_ptr(uint32_t slot) {
-    uint8_t* base = __nvshmem_efa_sq_buf;
-    uint32_t stride = __nvshmem_efa_sq_stride;
-    return base + (size_t)slot * (size_t)stride;
-}
-
-// NOTE: This posting path is a *placeholder* until you replace the WQE struct
-// and opcode with the actual ones from efagda/efa_io_defs.h. The sequence and
-// fences mirror GPUDirect Async best practices (write WQE, fence, ring DB).
+/**
+ * Device function to post RDMA Write via EFA GDA.
+ * Implementation follows the official fabtests cuda_kernel.cu pattern.
+ */
 __device__ void nvshmem_efa_dev_put(void* remote_addr,
                                     const void* src,
                                     size_t bytes,
                                     uint32_t lkey,
-                                    uint32_t rkey) {
-    // Reserve a WQE slot (ring buffer). For now a simple atomic tail.
+                                    uint32_t rkey,
+                                    uint16_t dest_qp_num,
+                                    uint16_t ah) {
+    // 1. Atomically reserve a WQE slot
     uint32_t slot = atomicAdd(&__nvshmem_efa_sq_tail, 1);
-    slot %= (__nvshmem_efa_sq_size ? __nvshmem_efa_sq_size : 1u);
+    uint32_t local_slot = slot & __nvshmem_efa_sq_mask;
 
-    // Format placeholder WQE
-    EfaWqeRdmaWrite wqe;
-#ifdef EFA_OPCODE_RDMA_WRITE_PLACEHOLDER
-    wqe.opcode = (uint32_t)EFA_OPCODE_RDMA_WRITE_PLACEHOLDER;
-#else
-    // If the real opcode macro is available from efa_io_defs.h, use it here.
-    wqe.opcode = 0; // TODO: replace
-#endif
-    wqe.flags  = 0; // TODO: signaled/fence bits as required by EFA
-    wqe.length = (uint32_t)bytes;
-    wqe.lkey   = lkey;
-    wqe.src_addr    = (uint64_t)(uintptr_t)src;
-    wqe.remote_addr = (uint64_t)(uintptr_t)remote_addr;
-    wqe.rkey        = rkey;
-    wqe.reserved    = 0;
+    // 2. Create WQE using official efa_io_tx_wqe structure
+    struct efa_io_tx_wqe wqe;
+    memset(&wqe, 0, sizeof(wqe));
 
-    // Write WQE into the SQ at the computed slot
-    uint8_t* dst = sq_slot_ptr(slot);
-    // Assumes WQE fits in entry_size; the real layout must match entry_size.
-    // A plain memcpy is sufficient because WQE is POD.
-    uint8_t* src_wqe = reinterpret_cast<uint8_t*>(&wqe);
-    for (size_t i = 0; i < sizeof(EfaWqeRdmaWrite); ++i) {
-        dst[i] = src_wqe[i];
-    }
+    // 3. Fill metadata fields
+    wqe.meta.dest_qp_num = dest_qp_num;
+    wqe.meta.ah = ah;
+    wqe.meta.length = bytes;
 
-    // Make writes visible to NIC before ringing doorbell
+    // 4. Set operation type to RDMA_WRITE using official macro
+    EFA_SET(&wqe.meta.ctrl1, EFA_IO_TX_META_DESC_OP_TYPE, EFA_IO_RDMA_WRITE);
+
+    // 5. Set phase bit (tracks queue wrap-around)
+    EFA_SET(&wqe.meta.ctrl2, EFA_IO_TX_META_DESC_PHASE, __nvshmem_efa_sq_phase);
+
+    // 6. Request completion notification
+    EFA_SET(&wqe.meta.ctrl2, EFA_IO_TX_META_DESC_COMP_REQ, 1);
+
+    // 7. Mark metadata descriptor as valid
+    EFA_SET(&wqe.meta.ctrl1, EFA_IO_TX_META_DESC_META_DESC, 1);
+
+    // 8. Fill RDMA request - remote memory address
+    wqe.data.rdma_req.remote_mem_addr.length = bytes;
+    wqe.data.rdma_req.remote_mem_addr.rkey = rkey;
+    wqe.data.rdma_req.remote_mem_addr.buf_addr = (uint64_t)(uintptr_t)remote_addr;
+
+    // 9. Fill RDMA request - local memory descriptor (scatter-gather list)
+    wqe.data.rdma_req.local_mem_desc[0].length = bytes;
+    wqe.data.rdma_req.local_mem_desc[0].lkey = lkey;
+
+    // Split 64-bit address into high/low 32-bit fields (EFA hardware requirement)
+    uint64_t src_addr = (uint64_t)(uintptr_t)src;
+    wqe.data.rdma_req.local_mem_desc[0].buf_addr_lo = src_addr & 0xFFFFFFFF;
+    wqe.data.rdma_req.local_mem_desc[0].buf_addr_hi = src_addr >> 32;
+
+    // 10. Calculate WQE offset in queue and copy
+    uint32_t sq_desc_offset = local_slot * __nvshmem_efa_sq_stride;
+    memcpy(__nvshmem_efa_sq_buf + sq_desc_offset, &wqe, sizeof(wqe));
+
+    // 11. Memory fence to ensure WQE is written before doorbell
     __threadfence_system();
 
-    // Ring doorbell if mapped for device (some stacks require writing producer index)
+    // 12. Ring doorbell (write producer counter, not slot index)
     if (__nvshmem_efa_sq_db) {
-        // Many providers require writing "new tail" or "+= 1" semantics.
-        // Here we write (slot+1) as a plausible producer index; adapt to EFA needs.
-        *__nvshmem_efa_sq_db = slot + 1;
-        __threadfence_system();
+        atomicExch(__nvshmem_efa_sq_db, slot + 1);
+    }
+
+    // 13. Update phase when queue wraps around
+    // Phase bit helps hardware distinguish new vs old WQEs
+    if (local_slot == __nvshmem_efa_sq_mask) {
+        atomicAdd(&__nvshmem_efa_sq_phase, 1);
     }
 }
 
-// A tiny kernel you can use for smoke tests (optional)
+/**
+ * Test kernel for smoke testing (optional)
+ * Launch with single thread to test WQE posting
+ */
 extern "C" __global__ void __nvshmem_efa_test_put_kernel(void* remote_addr,
                                                          const void* src,
                                                          size_t bytes,
                                                          uint32_t lkey,
-                                                         uint32_t rkey) {
+                                                         uint32_t rkey,
+                                                         uint16_t dest_qp_num,
+                                                         uint16_t ah) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        nvshmem_efa_dev_put(remote_addr, src, bytes, lkey, rkey);
+        nvshmem_efa_dev_put(remote_addr, src, bytes, lkey, rkey, dest_qp_num, ah);
     }
 }

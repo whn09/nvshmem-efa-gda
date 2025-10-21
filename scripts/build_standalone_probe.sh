@@ -13,7 +13,8 @@ CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 LIBFABRIC_HOME="${LIBFABRIC_HOME:-/opt/amazon/efa}"
 
 CXXFLAGS="${CXXFLAGS:-} -O2 -std=c++17 -fPIC"
-INCS="-I${LIBFABRIC_HOME}/include -I${CUDA_HOME}/include"
+# Add third_party/efa_gda to include path for efa_io_defs.h
+INCS="-I${LIBFABRIC_HOME}/include -I${CUDA_HOME}/include -I$(dirname "$0")/../third_party/efa_gda"
 LIBS="-L${LIBFABRIC_HOME}/lib -lfabric -L${CUDA_HOME}/lib64 -lcudart"
 
 echo "Compiling gda_probe..."

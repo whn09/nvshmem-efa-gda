@@ -1,28 +1,10 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // NVSHMEM + EFA GPUDirect Async scaffolding
-// This header declares the minimal API and device symbols used by the
+// This header declares the API and device symbols used by the
 // host-side libfabric/EFA GDA glue and the device-side posting kernels.
 //
-// IMPORTANT:
-// - This scaffolding *assumes* libfabric's EFA extension header <rdma/fi_ext_efa.h>
-//   is available at build time (provided by your EFA-enabled libfabric).
-// - The WQE (work queue entry) layout here is a *placeholder*. For a working
-//   implementation, replace with the *exact* layout/opcodes from fabtests:
-//     ofiwg/libfabric/fabtests/prov/efa/src/efagda/efa_io_defs.h
-//   You can place that header into: third_party/efa_gda/efa_io_defs.h
-//   and this header will include it automatically.
-//
-// References (to consult while replacing placeholders):
-//   - EFA GDA ops table: <rdma/fi_ext_efa.h>
-//   - Host-side usage:   fabtests/prov/efa/src/efa_gda.c
-//   - GPU-side sequence: fabtests/prov/efa/src/efagda/cuda_kernel.cu
-//
-// NOTE:
-// To avoid pulling in NVSHMEM internals here, the public init function
-// takes raw libfabric handles (fid_domain*, fid_ep*). Your NVSHMEM
-// libfabric transport should call nvshmemt_efa_gda_init_on_ep() *after*
-// endpoints are enabled and before you start traffic.
-//
+// Updated to use official EFA I/O definitions from libfabric fabtests:
+// https://github.com/ofiwg/libfabric/tree/main/fabtests/prov/efa/src/efagda
 
 #ifndef NVSHMEM_TRANSPORT_EFA_GDA_H_
 #define NVSHMEM_TRANSPORT_EFA_GDA_H_
@@ -33,9 +15,12 @@
 // Libfabric provider extension for EFA:
 #include <rdma/fi_ext_efa.h>
 
-// CUDA headers (device symbol declarations & cudaMemcpyToSymbol from .cpp)
+// CUDA headers
 #include <cuda.h>
 #include <cuda_runtime.h>
+
+// Include official EFA I/O definitions
+#include "../third_party/efa_gda/efa_io_defs.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,44 +31,27 @@ struct fid_domain;
 struct fid_ep;
 
 // ----------------------------
+// Helper macros for setting EFA descriptor fields
+// (from libfabric fabtests cuda_kernel.cu)
+// ----------------------------
+#define EFA_SET(reg, field, val) \
+    do { \
+        typeof(reg) tmp_reg = (reg); \
+        tmp_reg &= ~(field##_MASK); \
+        tmp_reg |= ((val) << (field##_SHIFT)) & (field##_MASK); \
+        (reg) = tmp_reg; \
+    } while (0)
+
+// ----------------------------
 // Device symbols published by host init (defined in .cu)
 // ----------------------------
 extern __device__ uint8_t*  __nvshmem_efa_sq_buf;     // SQ ring base (device-mapped)
-extern __device__ uint32_t* __nvshmem_efa_sq_db;      // SQ doorbell (device-mapped), if supported
+extern __device__ uint32_t* __nvshmem_efa_sq_db;      // SQ doorbell (device-mapped)
 extern __device__ uint32_t  __nvshmem_efa_sq_stride;  // bytes per WQE
 extern __device__ uint32_t  __nvshmem_efa_sq_size;    // number of WQE slots
 extern __device__ uint32_t  __nvshmem_efa_sq_tail;    // producer index (device-side)
-
-// ----------------------------
-// Placeholder WQE definition
-// ----------------------------
-// TODO: Replace with *exact* EFA WQE struct and flags/opcodes from
-//       fabtests efagda/efa_io_defs.h. You may instead include that file:
-//       #include "third_party/efa_gda/efa_io_defs.h"
-//
-// We intentionally keep a small placeholder to compile the pipeline end-to-end;
-// it will not function until replaced with the real layout.
-#ifndef NVSHMEM_EFA_GDA_HAS_REAL_WQE
-#pragma pack(push, 1)
-typedef struct {
-    // Minimal fields commonly required for an RDMA Write descriptor.
-    // Replace with actual EFA GDA layout:
-    uint32_t opcode;          // must match EFA opcode for RDMA write
-    uint32_t flags;           // e.g., fence, signaled, etc.
-    uint32_t length;          // payload bytes
-    uint32_t lkey;            // local MR key for 'src'
-    uint64_t src_addr;        // local GPU VA
-    uint64_t remote_addr;     // remote VA
-    uint32_t rkey;            // remote MR key
-    uint32_t reserved;        // align to known size if needed
-} EfaWqeRdmaWrite;
-#pragma pack(pop)
-
-// Placeholder opcode - must be replaced by the value from efa_io_defs.h
-#ifndef EFA_OPCODE_RDMA_WRITE_PLACEHOLDER
-#define EFA_OPCODE_RDMA_WRITE_PLACEHOLDER (0x0E) // TODO: replace with real EFA opcode
-#endif
-#endif // NVSHMEM_EFA_GDA_HAS_REAL_WQE
+extern __device__ uint32_t  __nvshmem_efa_sq_phase;   // phase bit for queue wrap
+extern __device__ uint32_t  __nvshmem_efa_sq_mask;    // queue mask (size - 1)
 
 // ----------------------------
 // Host-side API
@@ -117,16 +85,18 @@ void nvshmemt_efa_gda_fini(void);
  * @param bytes        Payload size in bytes.
  * @param lkey         Local MR key (for 'src'); pass from host.
  * @param rkey         Remote MR key (for remote_addr).
+ * @param dest_qp_num  Destination QP number.
+ * @param ah           Address handle for destination.
  *
- * NOTE: This placeholder formats a synthetic WQE and rings a doorbell. It will
- * not produce a working packet until you replace the WQE layout/opcode with
- * the EFA GDA definitions from efa_io_defs.h (see TODO above).
+ * This implementation uses the official EFA WQE structure from efa_io_defs.h.
  */
 __device__ void nvshmem_efa_dev_put(void* remote_addr,
                                     const void* src,
                                     size_t bytes,
                                     uint32_t lkey,
-                                    uint32_t rkey);
+                                    uint32_t rkey,
+                                    uint16_t dest_qp_num,
+                                    uint16_t ah);
 
 #ifdef __cplusplus
 } // extern "C"
