@@ -104,13 +104,13 @@ target_include_directories(nvshmem_efa_gda_objs PRIVATE ${CUDA_HOME}/include)
 EOF
 fi
 
-# 6) Rebuild using the top-level NVSHMEM CMake/Ninja if present
-if [[ -d "${NVSHMEM_SRC}/build" ]]; then
-  cmake --build "${NVSHMEM_SRC}/build" --target install -j
-else
-  echo "INFO: No NVSHMEM build dir found. Build manually, e.g.:"
-  echo "  cmake -S ${NVSHMEM_SRC} -B ${NVSHMEM_SRC}/build -G Ninja ..."
-  echo "  cmake --build ${NVSHMEM_SRC}/build --target install -j"
-fi
+# # 6) Rebuild using the top-level NVSHMEM CMake/Ninja if present
+# if [[ -d "${NVSHMEM_SRC}/build" ]]; then
+#   cmake --build "${NVSHMEM_SRC}/build" --target install -j
+# else
+#   echo "INFO: No NVSHMEM build dir found. Build manually, e.g.:"
+#   echo "  cmake -S ${NVSHMEM_SRC} -B ${NVSHMEM_SRC}/build -G Ninja ..."
+#   echo "  cmake --build ${NVSHMEM_SRC}/build --target install -j"
+# fi
 
 echo "Done."
